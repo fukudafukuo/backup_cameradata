@@ -58,6 +58,7 @@ function backupPhotographerData() {
           state.totalCopied = totalCopied;
           state.totalFolders = totalFolders;
           props.setProperty('backupState', JSON.stringify(state));
+          saveSyncCache_();
           scheduleContinuation_();
           Logger.log('--- 4分経過: 中断して1分後に再開 ---');
           Logger.log('進捗: カメラマン ' + (p+1) + '/' + photographers.length + ', 月 ' + (m+1) + '/' + months.length);
@@ -87,6 +88,7 @@ function backupPhotographerData() {
           state.totalCopied = totalCopied;
           state.totalFolders = totalFolders;
           props.setProperty('backupState', JSON.stringify(state));
+          saveSyncCache_();
           scheduleContinuation_();
           Logger.log('--- ファイルコピー中に中断 ---');
           return;
@@ -102,6 +104,7 @@ function backupPhotographerData() {
           state.totalCopied = totalCopied;
           state.totalFolders = totalFolders;
           props.setProperty('backupState', JSON.stringify(state));
+          saveSyncCache_();
           scheduleContinuation_();
           Logger.log('--- サブフォルダ処理中に中断 ---');
           return;
@@ -118,6 +121,7 @@ function backupPhotographerData() {
         state.totalCopied = totalCopied;
         state.totalFolders = totalFolders;
         props.setProperty('backupState', JSON.stringify(state));
+        saveSyncCache_();
         scheduleContinuation_();
         Logger.log('--- 直接ファイルコピー中に中断 ---');
         return;
@@ -125,6 +129,7 @@ function backupPhotographerData() {
     }
 
     props.deleteProperty('backupState');
+    saveSyncCache_();
     removeContinuationTriggers_();
 
     var msg = '=== バックアップ完了 ===\n' +
@@ -143,6 +148,7 @@ function backupPhotographerData() {
     state.totalCopied = totalCopied;
     state.totalFolders = totalFolders;
     props.setProperty('backupState', JSON.stringify(state));
+    saveSyncCache_();
     scheduleContinuation_();
     Logger.log('--- エラー発生: 1分後に続きから再開予定 ---');
   }
@@ -157,6 +163,29 @@ function getFolderList_(parent) {
 
 // 実行中のフォルダ検索結果キャッシュ（getFoldersByName の API 呼び出しを削減）
 var FOLDER_CACHE_ = {};
+
+// 永続同期キャッシュ: 前回同期時のソースフォルダのファイル数を記憶
+// キャッシュヒット→dest側のAPIコールを丸ごとスキップ
+// キー: ソースフォルダID, 値: ファイル数（"s:" プレフィックス付きはサブフォルダ数）
+var SYNC_CACHE_ = null;
+
+function loadSyncCache_() {
+  if (SYNC_CACHE_ !== null) return;
+  var raw = PropertiesService.getScriptProperties().getProperty('syncCache');
+  SYNC_CACHE_ = raw ? JSON.parse(raw) : {};
+}
+
+function saveSyncCache_() {
+  if (!SYNC_CACHE_) return;
+  var json = JSON.stringify(SYNC_CACHE_);
+  // PropertiesService は 1プロパティ 9KB まで。超えたらキャッシュをリセット
+  if (json.length > 8000) {
+    Logger.log('  [キャッシュ] サイズ超過のためリセット (' + json.length + 'bytes)');
+    SYNC_CACHE_ = {};
+    json = '{}';
+  }
+  PropertiesService.getScriptProperties().setProperty('syncCache', json);
+}
 
 function getOrCreateFolder_(parent, name) {
   var cacheKey = parent.getId() + '/' + name;
@@ -198,6 +227,13 @@ function copyNewFiles_(src, dest, startTime) {
   while (srcIter.hasNext()) srcFiles.push(srcIter.next());
   if (srcFiles.length === 0) return { copied: 0, timedOut: false };
 
+  // 永続キャッシュ: 前回同期時と同じファイル数なら dest 側を丸ごとスキップ
+  loadSyncCache_();
+  var srcId = src.getId();
+  if (SYNC_CACHE_[srcId] === srcFiles.length) {
+    return { copied: 0, timedOut: false };
+  }
+
   // バックアップ先の既存ファイルマップを構築
   var existing = {};
   var destCount = 0;
@@ -213,7 +249,10 @@ function copyNewFiles_(src, dest, startTime) {
     for (var i = 0; i < srcFiles.length; i++) {
       if (!existing[srcFiles[i].getName()]) { allExist = false; break; }
     }
-    if (allExist) return { copied: 0, timedOut: false };
+    if (allExist) {
+      SYNC_CACHE_[srcId] = srcFiles.length;
+      return { copied: 0, timedOut: false };
+    }
   }
 
   // 新規ファイルのみコピー
@@ -237,29 +276,22 @@ function copyNewFiles_(src, dest, startTime) {
     }
   }
   if (skipped > 0) Logger.log('    スキップ: ' + skipped + '件');
+  // タイムアウトせず完了した場合のみキャッシュ更新
+  SYNC_CACHE_[srcId] = srcFiles.length;
   return { copied: copied, timedOut: false };
 }
 
-/**
- * src と dest のファイル数・サブフォルダ数を比較し、一致すれば変更なしと判定
- */
-function isFolderSynced_(src, dest) {
-  var srcFileCount = 0, destFileCount = 0;
-  var si = src.getFiles();
-  while (si.hasNext()) { si.next(); srcFileCount++; }
-  var di = dest.getFiles();
-  while (di.hasNext()) { di.next(); destFileCount++; }
-  if (srcFileCount !== destFileCount) return false;
-
-  var srcFolders = getFolderList_(src);
-  var destFolders = getFolderList_(dest);
-  return srcFolders.length === destFolders.length;
-}
-
 function copySubfolders_(src, dest, startTime) {
-  var copied = 0, folders = 0;
-  var subs = getFolderList_(src);
+  // サブフォルダ数の永続キャッシュ: 0件なら getFolderList_ 自体をスキップ
+  loadSyncCache_();
+  var srcId = 's:' + src.getId();
+  if (SYNC_CACHE_[srcId] === 0) return { copied: 0, folders: 0, timedOut: false };
 
+  var subs = getFolderList_(src);
+  SYNC_CACHE_[srcId] = subs.length;
+  if (subs.length === 0) return { copied: 0, folders: 0, timedOut: false };
+
+  var copied = 0, folders = 0;
   for (var i = 0; i < subs.length; i++) {
     if (new Date().getTime() - startTime > CONFIG.MAX_RUNTIME_MS) {
       return { copied: copied, folders: folders, timedOut: true };
@@ -268,9 +300,7 @@ function copySubfolders_(src, dest, startTime) {
     var d = getOrCreateFolder_(dest, sub.getName());
     if (d.isNew) folders++;
 
-    // 既存フォルダでファイル数・サブフォルダ数が一致→再帰をスキップ
-    if (!d.isNew && isFolderSynced_(sub, d.folder)) continue;
-
+    // copyNewFiles_ 内部で永続キャッシュを使い、変更なしなら dest 側をスキップ
     var r = copyNewFiles_(sub, d.folder, startTime);
     copied += r.copied;
     if (r.timedOut) return { copied: copied, folders: folders, timedOut: true };
@@ -289,6 +319,13 @@ function copyDirectFiles_(photographer, backupFolder, photographerName, startTim
 
   var srcFiles = [];
   while (srcIter.hasNext()) srcFiles.push(srcIter.next());
+
+  // 永続キャッシュ: 直接ファイル数が前回と同じならスキップ
+  loadSyncCache_();
+  var srcId = 'd:' + photographer.getId();
+  if (SYNC_CACHE_[srcId] === srcFiles.length) {
+    return { copied: 0, folders: 0, timedOut: false };
+  }
 
   var copied = 0, folders = 0;
   var uf = getOrCreateFolder_(backupFolder, '_未分類');
@@ -316,6 +353,7 @@ function copyDirectFiles_(photographer, backupFolder, photographerName, startTim
       }
     }
   }
+  SYNC_CACHE_[srcId] = srcFiles.length;
   return { copied: copied, folders: folders, timedOut: false };
 }
 
@@ -360,11 +398,17 @@ function removeAllTriggers() {
   for (var i = 0; i < triggers.length; i++) {
     ScriptApp.deleteTrigger(triggers[i]);
   }
-  PropertiesService.getScriptProperties().deleteProperty('backupState');
+  var sp = PropertiesService.getScriptProperties();
+  sp.deleteProperty('backupState');
+  sp.deleteProperty('syncCache');
+  SYNC_CACHE_ = null;
   Logger.log('すべてのトリガーと状態をリセットしました。');
 }
 
 function resetState() {
-  PropertiesService.getScriptProperties().deleteProperty('backupState');
-  Logger.log('バックアップ状態をリセットしました。');
+  var sp = PropertiesService.getScriptProperties();
+  sp.deleteProperty('backupState');
+  sp.deleteProperty('syncCache');
+  SYNC_CACHE_ = null;
+  Logger.log('バックアップ状態と同期キャッシュをリセットしました。');
 }
