@@ -100,7 +100,7 @@ function backupPhotographerData() {
 
         if (subResult.timedOut) {
           state.photographerIndex = p;
-          state.monthIndex = m + 1;
+          state.monthIndex = m;  // 同じ月を再処理（キャッシュ済みサブフォルダは高速スキップ）
           state.totalCopied = totalCopied;
           state.totalFolders = totalFolders;
           props.setProperty('backupState', JSON.stringify(state));
@@ -173,6 +173,13 @@ function loadSyncCache_() {
   if (SYNC_CACHE_ !== null) return;
   var raw = PropertiesService.getScriptProperties().getProperty('syncCache');
   SYNC_CACHE_ = raw ? JSON.parse(raw) : {};
+  // 24時間以上経過したキャッシュは無効化（定期的に全フォルダを再検証）
+  var now = new Date().getTime();
+  if (SYNC_CACHE_._ts && now - SYNC_CACHE_._ts > 24 * 60 * 60 * 1000) {
+    Logger.log('  [キャッシュ] 24時間経過のためリセット');
+    SYNC_CACHE_ = {};
+  }
+  if (!SYNC_CACHE_._ts) SYNC_CACHE_._ts = now;
 }
 
 function saveSyncCache_() {
@@ -225,7 +232,11 @@ function copyNewFiles_(src, dest, startTime) {
   var srcIter = retryDriveCall_(function() { return src.getFiles(); }, 'getFiles(src)');
   var srcFiles = [];
   while (srcIter.hasNext()) srcFiles.push(srcIter.next());
-  if (srcFiles.length === 0) return { copied: 0, timedOut: false };
+  if (srcFiles.length === 0) {
+    loadSyncCache_();
+    SYNC_CACHE_[src.getId()] = 0;
+    return { copied: 0, timedOut: false };
+  }
 
   // 永続キャッシュ: 前回同期時と同じファイル数なら dest 側を丸ごとスキップ
   loadSyncCache_();
@@ -297,10 +308,17 @@ function copySubfolders_(src, dest, startTime) {
       return { copied: copied, folders: folders, timedOut: true };
     }
     var sub = subs[i];
+    var subId = sub.getId();
+
+    // キャッシュ済みリーフフォルダ: ファイル数もサブフォルダ数(0)もキャッシュ済み
+    // → getOrCreateFolder_ / copyNewFiles_ / 再帰を全てスキップ（0 APIコール）
+    if (SYNC_CACHE_[subId] !== undefined && SYNC_CACHE_['s:' + subId] === 0) {
+      continue;
+    }
+
     var d = getOrCreateFolder_(dest, sub.getName());
     if (d.isNew) folders++;
 
-    // copyNewFiles_ 内部で永続キャッシュを使い、変更なしなら dest 側をスキップ
     var r = copyNewFiles_(sub, d.folder, startTime);
     copied += r.copied;
     if (r.timedOut) return { copied: copied, folders: folders, timedOut: true };
