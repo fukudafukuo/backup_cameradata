@@ -1,8 +1,9 @@
 /**
- * Google Drive カメラマンデータ自動バックアップスクリプト v2
+ * Google Drive カメラマンデータ自動バックアップスクリプト v3
  *
- * タイムアウト対策: 5分経過で自動中断 → 1分後に続きから再開
+ * タイムアウト対策: 4分経過で自動中断 → 1分後に続きから再開
  * PropertiesService でチェックポイントを保存
+ * Drive API一時エラー対策: リトライ+指数バックオフ
  *
  * ソース: カメラマン > 月
  * バックアップ先: 月 > カメラマン に変換して複製
@@ -11,7 +12,9 @@
 var CONFIG = {
   SOURCE_FOLDER_ID: '1CyxRN30gHXnmziPWnFnmPpP_M93k8Asc',
   BACKUP_FOLDER_ID: '1OLQgJQMHBuV9Xrvzaz1X0RJhLO7NnWJY',
-  MAX_RUNTIME_MS: 5 * 60 * 1000,
+  MAX_RUNTIME_MS: 4 * 60 * 1000,
+  RETRY_MAX: 3,
+  RETRY_WAIT_MS: 2000,
   NOTIFICATION_EMAIL: ''
 };
 
@@ -56,7 +59,7 @@ function backupPhotographerData() {
           state.totalFolders = totalFolders;
           props.setProperty('backupState', JSON.stringify(state));
           scheduleContinuation_();
-          Logger.log('--- 5分経過: 中断して1分後に再開 ---');
+          Logger.log('--- 4分経過: 中断して1分後に再開 ---');
           Logger.log('進捗: カメラマン ' + (p+1) + '/' + photographers.length + ', 月 ' + (m+1) + '/' + months.length);
           Logger.log('ここまで ' + totalCopied + '件コピー');
           return;
@@ -114,9 +117,12 @@ function backupPhotographerData() {
 
   } catch (e) {
     Logger.log('[エラー] ' + e.message + '\n' + e.stack);
-    props.deleteProperty('backupState');
-    removeContinuationTriggers_();
-    throw e;
+    // エラー時も進捗を保存して次回続きから再開できるようにする
+    state.totalCopied = totalCopied;
+    state.totalFolders = totalFolders;
+    props.setProperty('backupState', JSON.stringify(state));
+    scheduleContinuation_();
+    Logger.log('--- エラー発生: 1分後に続きから再開予定 ---');
   }
 }
 
@@ -133,20 +139,45 @@ function getOrCreateFolder_(parent, name) {
   return { folder: parent.createFolder(name), isNew: true };
 }
 
+/**
+ * Drive API呼び出しをリトライ付きで実行する
+ */
+function retryDriveCall_(fn, label) {
+  for (var attempt = 0; attempt <= CONFIG.RETRY_MAX; attempt++) {
+    try {
+      return fn();
+    } catch (e) {
+      if (attempt === CONFIG.RETRY_MAX) throw e;
+      var wait = CONFIG.RETRY_WAIT_MS * Math.pow(2, attempt);
+      Logger.log('    [リトライ ' + (attempt + 1) + '/' + CONFIG.RETRY_MAX + '] ' +
+        (label || '') + ' (' + wait + 'ms待機)');
+      Utilities.sleep(wait);
+    }
+  }
+}
+
 function copyNewFiles_(src, dest) {
   var existing = {};
-  var iter = dest.getFiles();
+  var iter = retryDriveCall_(function() { return dest.getFiles(); }, 'getFiles(dest)');
   while (iter.hasNext()) existing[iter.next().getName()] = true;
 
   var copied = 0;
-  iter = src.getFiles();
+  var skipped = 0;
+  iter = retryDriveCall_(function() { return src.getFiles(); }, 'getFiles(src)');
   while (iter.hasNext()) {
     var f = iter.next();
-    if (!existing[f.getName()]) {
-      f.makeCopy(f.getName(), dest);
-      copied++;
+    var name = f.getName();
+    if (!existing[name]) {
+      try {
+        retryDriveCall_(function() { f.makeCopy(name, dest); }, 'makeCopy: ' + name);
+        copied++;
+      } catch (e) {
+        Logger.log('    [スキップ] ' + name + ': ' + e.message);
+        skipped++;
+      }
     }
   }
+  if (skipped > 0) Logger.log('    スキップ: ' + skipped + '件');
   return { copied: copied };
 }
 
@@ -174,7 +205,7 @@ function copySubfolders_(src, dest, startTime) {
 }
 
 function copyDirectFiles_(photographer, backupFolder, photographerName) {
-  var iter = photographer.getFiles();
+  var iter = retryDriveCall_(function() { return photographer.getFiles(); }, 'getFiles(photographer)');
   var copied = 0, folders = 0;
   if (!iter.hasNext()) return { copied: 0, folders: 0 };
 
@@ -185,10 +216,15 @@ function copyDirectFiles_(photographer, backupFolder, photographerName) {
 
   while (iter.hasNext()) {
     var f = iter.next();
-    var ex = up.folder.getFilesByName(f.getName());
+    var name = f.getName();
+    var ex = up.folder.getFilesByName(name);
     if (!ex.hasNext()) {
-      f.makeCopy(f.getName(), up.folder);
-      copied++;
+      try {
+        retryDriveCall_(function() { f.makeCopy(name, up.folder); }, 'makeCopy: ' + name);
+        copied++;
+      } catch (e) {
+        Logger.log('    [スキップ] ' + name + ': ' + e.message);
+      }
     }
   }
   return { copied: copied, folders: folders };
@@ -206,11 +242,12 @@ function removeContinuationTriggers_() {
   var triggers = ScriptApp.getProjectTriggers();
   for (var i = triggers.length - 1; i >= 0; i--) {
     var t = triggers[i];
-    if (t.getHandlerFunction() === 'backupPhotographerData') {
-      // everyHours トリガーは残す、after() トリガーだけ削除
-      // after() トリガーは getTriggerSource() が CLOCK で isTimeBased
-      // 区別が難しいので全部消してから12hを再設定する方式に変更せず
-      // ここでは何もしない（setupで管理）
+    if (t.getHandlerFunction() === 'backupPhotographerData' &&
+        t.getEventType() === ScriptApp.EventType.CLOCK) {
+      // after() で作成されたワンショットトリガーを削除
+      // everyHours トリガーも CLOCK だが、after トリガーと区別できないため
+      // 全て削除し、定期実行が必要なら setupTwiceDailyTrigger() を再実行する
+      ScriptApp.deleteTrigger(t);
     }
   }
 }
