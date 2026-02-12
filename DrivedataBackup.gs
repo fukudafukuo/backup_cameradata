@@ -135,17 +135,23 @@ function getOrCreateFolder_(parent, name) {
 
 function copyNewFiles_(src, dest) {
   var existing = {};
+  var existCount = 0;
   var iter = dest.getFiles();
-  while (iter.hasNext()) existing[iter.next().getName()] = true;
+  while (iter.hasNext()) { existing[iter.next().getName()] = true; existCount++; }
 
-  var copied = 0;
+  var copied = 0, skipped = 0;
   iter = src.getFiles();
   while (iter.hasNext()) {
     var f = iter.next();
     if (!existing[f.getName()]) {
       f.makeCopy(f.getName(), dest);
       copied++;
+    } else {
+      skipped++;
     }
+  }
+  if (skipped > 0) {
+    Logger.log('      スキップ: ' + skipped + '件 (既存), コピー: ' + copied + '件 (新規)');
   }
   return { copied: copied };
 }
@@ -183,10 +189,14 @@ function copyDirectFiles_(photographer, backupFolder, photographerName) {
   var up = getOrCreateFolder_(uf.folder, photographerName);
   if (up.isNew) folders++;
 
+  // マップ方式で既存ファイルを一括取得（APIコール削減）
+  var existing = {};
+  var exIter = up.folder.getFiles();
+  while (exIter.hasNext()) existing[exIter.next().getName()] = true;
+
   while (iter.hasNext()) {
     var f = iter.next();
-    var ex = up.folder.getFilesByName(f.getName());
-    if (!ex.hasNext()) {
+    if (!existing[f.getName()]) {
       f.makeCopy(f.getName(), up.folder);
       copied++;
     }
@@ -203,16 +213,19 @@ function scheduleContinuation_() {
 }
 
 function removeContinuationTriggers_() {
+  // backupPhotographerData のトリガーを全削除し、定期実行トリガーを再設定
   var triggers = ScriptApp.getProjectTriggers();
   for (var i = triggers.length - 1; i >= 0; i--) {
     var t = triggers[i];
     if (t.getHandlerFunction() === 'backupPhotographerData') {
-      // everyHours トリガーは残す、after() トリガーだけ削除
-      // after() トリガーは getTriggerSource() が CLOCK で isTimeBased
-      // 区別が難しいので全部消してから12hを再設定する方式に変更せず
-      // ここでは何もしない（setupで管理）
+      ScriptApp.deleteTrigger(t);
     }
   }
+  // 定期実行トリガー（12時間ごと）を再設定
+  ScriptApp.newTrigger('backupPhotographerData')
+    .timeBased()
+    .everyHours(12)
+    .create();
 }
 
 function setupTwiceDailyTrigger() {
