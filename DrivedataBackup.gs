@@ -155,10 +155,23 @@ function getFolderList_(parent) {
   return list;
 }
 
+// 実行中のフォルダ検索結果キャッシュ（getFoldersByName の API 呼び出しを削減）
+var FOLDER_CACHE_ = {};
+
 function getOrCreateFolder_(parent, name) {
+  var cacheKey = parent.getId() + '/' + name;
+  if (FOLDER_CACHE_[cacheKey]) {
+    return { folder: FOLDER_CACHE_[cacheKey], isNew: false };
+  }
   var iter = parent.getFoldersByName(name);
-  if (iter.hasNext()) return { folder: iter.next(), isNew: false };
-  return { folder: parent.createFolder(name), isNew: true };
+  if (iter.hasNext()) {
+    var folder = iter.next();
+    FOLDER_CACHE_[cacheKey] = folder;
+    return { folder: folder, isNew: false };
+  }
+  var folder = parent.createFolder(name);
+  FOLDER_CACHE_[cacheKey] = folder;
+  return { folder: folder, isNew: true };
 }
 
 /**
@@ -179,19 +192,39 @@ function retryDriveCall_(fn, label) {
 }
 
 function copyNewFiles_(src, dest, startTime) {
-  var existing = {};
-  var iter = retryDriveCall_(function() { return dest.getFiles(); }, 'getFiles(dest)');
-  while (iter.hasNext()) existing[iter.next().getName()] = true;
+  // ソースファイルを先に収集（空なら dest の列挙を丸ごとスキップ）
+  var srcIter = retryDriveCall_(function() { return src.getFiles(); }, 'getFiles(src)');
+  var srcFiles = [];
+  while (srcIter.hasNext()) srcFiles.push(srcIter.next());
+  if (srcFiles.length === 0) return { copied: 0, timedOut: false };
 
+  // バックアップ先の既存ファイルマップを構築
+  var existing = {};
+  var destCount = 0;
+  var destIter = retryDriveCall_(function() { return dest.getFiles(); }, 'getFiles(dest)');
+  while (destIter.hasNext()) {
+    existing[destIter.next().getName()] = true;
+    destCount++;
+  }
+
+  // dest が src 以上のファイル数なら、全名前一致チェックだけで判定
+  if (destCount >= srcFiles.length) {
+    var allExist = true;
+    for (var i = 0; i < srcFiles.length; i++) {
+      if (!existing[srcFiles[i].getName()]) { allExist = false; break; }
+    }
+    if (allExist) return { copied: 0, timedOut: false };
+  }
+
+  // 新規ファイルのみコピー
   var copied = 0;
   var skipped = 0;
-  iter = retryDriveCall_(function() { return src.getFiles(); }, 'getFiles(src)');
-  while (iter.hasNext()) {
+  for (var i = 0; i < srcFiles.length; i++) {
     if (startTime && new Date().getTime() - startTime > CONFIG.MAX_RUNTIME_MS) {
       if (skipped > 0) Logger.log('    スキップ: ' + skipped + '件');
       return { copied: copied, timedOut: true };
     }
-    var f = iter.next();
+    var f = srcFiles[i];
     var name = f.getName();
     if (!existing[name]) {
       try {
@@ -207,8 +240,24 @@ function copyNewFiles_(src, dest, startTime) {
   return { copied: copied, timedOut: false };
 }
 
+/**
+ * src と dest のファイル数・サブフォルダ数を比較し、一致すれば変更なしと判定
+ */
+function isFolderSynced_(src, dest) {
+  var srcFileCount = 0, destFileCount = 0;
+  var si = src.getFiles();
+  while (si.hasNext()) { si.next(); srcFileCount++; }
+  var di = dest.getFiles();
+  while (di.hasNext()) { di.next(); destFileCount++; }
+  if (srcFileCount !== destFileCount) return false;
+
+  var srcFolders = getFolderList_(src);
+  var destFolders = getFolderList_(dest);
+  return srcFolders.length === destFolders.length;
+}
+
 function copySubfolders_(src, dest, startTime) {
-  var copied = 0, folders = 0, timedOut = false;
+  var copied = 0, folders = 0;
   var subs = getFolderList_(src);
 
   for (var i = 0; i < subs.length; i++) {
@@ -218,6 +267,9 @@ function copySubfolders_(src, dest, startTime) {
     var sub = subs[i];
     var d = getOrCreateFolder_(dest, sub.getName());
     if (d.isNew) folders++;
+
+    // 既存フォルダでファイル数・サブフォルダ数が一致→再帰をスキップ
+    if (!d.isNew && isFolderSynced_(sub, d.folder)) continue;
 
     var r = copyNewFiles_(sub, d.folder, startTime);
     copied += r.copied;
@@ -232,23 +284,30 @@ function copySubfolders_(src, dest, startTime) {
 }
 
 function copyDirectFiles_(photographer, backupFolder, photographerName, startTime) {
-  var iter = retryDriveCall_(function() { return photographer.getFiles(); }, 'getFiles(photographer)');
-  var copied = 0, folders = 0;
-  if (!iter.hasNext()) return { copied: 0, folders: 0, timedOut: false };
+  var srcIter = retryDriveCall_(function() { return photographer.getFiles(); }, 'getFiles(photographer)');
+  if (!srcIter.hasNext()) return { copied: 0, folders: 0, timedOut: false };
 
+  var srcFiles = [];
+  while (srcIter.hasNext()) srcFiles.push(srcIter.next());
+
+  var copied = 0, folders = 0;
   var uf = getOrCreateFolder_(backupFolder, '_未分類');
   if (uf.isNew) folders++;
   var up = getOrCreateFolder_(uf.folder, photographerName);
   if (up.isNew) folders++;
 
-  while (iter.hasNext()) {
+  // 1回の getFiles() でバックアップ先の既存ファイルマップを構築
+  var existing = {};
+  var destIter = retryDriveCall_(function() { return up.folder.getFiles(); }, 'getFiles(dest)');
+  while (destIter.hasNext()) existing[destIter.next().getName()] = true;
+
+  for (var i = 0; i < srcFiles.length; i++) {
     if (startTime && new Date().getTime() - startTime > CONFIG.MAX_RUNTIME_MS) {
       return { copied: copied, folders: folders, timedOut: true };
     }
-    var f = iter.next();
+    var f = srcFiles[i];
     var name = f.getName();
-    var ex = up.folder.getFilesByName(name);
-    if (!ex.hasNext()) {
+    if (!existing[name]) {
       try {
         retryDriveCall_(function() { f.makeCopy(name, up.folder); }, 'makeCopy: ' + name);
         copied++;
