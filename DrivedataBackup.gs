@@ -74,11 +74,22 @@ function backupPhotographerData() {
         var bPhotographer = getOrCreateFolder_(bMonth.folder, photographerName);
         if (bPhotographer.isNew) totalFolders++;
 
-        var result = copyNewFiles_(monthFolder, bPhotographer.folder);
+        var result = copyNewFiles_(monthFolder, bPhotographer.folder, startTime);
         totalCopied += result.copied;
 
         if (result.copied > 0) {
           Logger.log('    ' + monthName + ': ' + result.copied + '件複製');
+        }
+
+        if (result.timedOut) {
+          state.photographerIndex = p;
+          state.monthIndex = m;
+          state.totalCopied = totalCopied;
+          state.totalFolders = totalFolders;
+          props.setProperty('backupState', JSON.stringify(state));
+          scheduleContinuation_();
+          Logger.log('--- ファイルコピー中に中断 ---');
+          return;
         }
 
         var subResult = copySubfolders_(monthFolder, bPhotographer.folder, startTime);
@@ -97,9 +108,20 @@ function backupPhotographerData() {
         }
       }
 
-      var directResult = copyDirectFiles_(photographer, backupFolder, photographerName);
+      var directResult = copyDirectFiles_(photographer, backupFolder, photographerName, startTime);
       totalCopied += directResult.copied;
       totalFolders += directResult.folders;
+
+      if (directResult.timedOut) {
+        state.photographerIndex = p + 1;
+        state.monthIndex = 0;
+        state.totalCopied = totalCopied;
+        state.totalFolders = totalFolders;
+        props.setProperty('backupState', JSON.stringify(state));
+        scheduleContinuation_();
+        Logger.log('--- 直接ファイルコピー中に中断 ---');
+        return;
+      }
     }
 
     props.deleteProperty('backupState');
@@ -156,7 +178,7 @@ function retryDriveCall_(fn, label) {
   }
 }
 
-function copyNewFiles_(src, dest) {
+function copyNewFiles_(src, dest, startTime) {
   var existing = {};
   var iter = retryDriveCall_(function() { return dest.getFiles(); }, 'getFiles(dest)');
   while (iter.hasNext()) existing[iter.next().getName()] = true;
@@ -165,6 +187,10 @@ function copyNewFiles_(src, dest) {
   var skipped = 0;
   iter = retryDriveCall_(function() { return src.getFiles(); }, 'getFiles(src)');
   while (iter.hasNext()) {
+    if (startTime && new Date().getTime() - startTime > CONFIG.MAX_RUNTIME_MS) {
+      if (skipped > 0) Logger.log('    スキップ: ' + skipped + '件');
+      return { copied: copied, timedOut: true };
+    }
     var f = iter.next();
     var name = f.getName();
     if (!existing[name]) {
@@ -178,7 +204,7 @@ function copyNewFiles_(src, dest) {
     }
   }
   if (skipped > 0) Logger.log('    スキップ: ' + skipped + '件');
-  return { copied: copied };
+  return { copied: copied, timedOut: false };
 }
 
 function copySubfolders_(src, dest, startTime) {
@@ -193,8 +219,9 @@ function copySubfolders_(src, dest, startTime) {
     var d = getOrCreateFolder_(dest, sub.getName());
     if (d.isNew) folders++;
 
-    var r = copyNewFiles_(sub, d.folder);
+    var r = copyNewFiles_(sub, d.folder, startTime);
     copied += r.copied;
+    if (r.timedOut) return { copied: copied, folders: folders, timedOut: true };
 
     var sr = copySubfolders_(sub, d.folder, startTime);
     copied += sr.copied;
@@ -204,10 +231,10 @@ function copySubfolders_(src, dest, startTime) {
   return { copied: copied, folders: folders, timedOut: false };
 }
 
-function copyDirectFiles_(photographer, backupFolder, photographerName) {
+function copyDirectFiles_(photographer, backupFolder, photographerName, startTime) {
   var iter = retryDriveCall_(function() { return photographer.getFiles(); }, 'getFiles(photographer)');
   var copied = 0, folders = 0;
-  if (!iter.hasNext()) return { copied: 0, folders: 0 };
+  if (!iter.hasNext()) return { copied: 0, folders: 0, timedOut: false };
 
   var uf = getOrCreateFolder_(backupFolder, '_未分類');
   if (uf.isNew) folders++;
@@ -215,6 +242,9 @@ function copyDirectFiles_(photographer, backupFolder, photographerName) {
   if (up.isNew) folders++;
 
   while (iter.hasNext()) {
+    if (startTime && new Date().getTime() - startTime > CONFIG.MAX_RUNTIME_MS) {
+      return { copied: copied, folders: folders, timedOut: true };
+    }
     var f = iter.next();
     var name = f.getName();
     var ex = up.folder.getFilesByName(name);
@@ -227,7 +257,7 @@ function copyDirectFiles_(photographer, backupFolder, photographerName) {
       }
     }
   }
-  return { copied: copied, folders: folders };
+  return { copied: copied, folders: folders, timedOut: false };
 }
 
 function scheduleContinuation_() {
